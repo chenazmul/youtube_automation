@@ -114,8 +114,8 @@ def get_original_basename(sanitized_path):
 
 
 # 🔹 কনফিগারেশন
-BASE_PATH = "D:/video_project/"
-OLD_AUDIO_FOLDER = "D:/video_project/old_audio"
+BASE_PATH = "G:/video_project/"
+OLD_AUDIO_FOLDER = "G:/video_project/old_audio"
 YOUTUBE_URL_FILE = os.path.join(BASE_PATH, "youtube_urls.txt")
 YOUTUBE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_urls.txt")
 # AI ভয়েস ভিডিও URL ফাইল
