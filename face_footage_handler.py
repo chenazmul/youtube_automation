@@ -179,7 +179,6 @@ class FaceFootageHandler:
         except Exception as e:
             print(f"❌ Error combining footage: {e}")
             return False
-        
     # Create a simpler, more reliable transition that works with FFmpeg
 def create_smooth_transition(face_footage, stock_footage, output_file, transition_time=1.0):
     """

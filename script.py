@@ -11,6 +11,7 @@ import torch
 import requests
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider 
@@ -22,6 +23,11 @@ from metadata_updater import process_video_metadata
 from ai_voice_generator import transcribe_and_generate_ai_voice  # AI ভয়েস ফাংশন ইমপোর্ট করা হচ্ছে
 import time
 from face_footage_handler import FaceFootageHandler
+import math  # যোগ করুন যদি আগে না থাকে
+from subtitle_design import generate_subtitles_karaoke_chunked
+
+# # voice_cloning.py ফাইল ইমপোর্ট করুন
+# from voice_cloning import generate_cloned_voice_from_transcript
 
 load_dotenv()  # এটি আপনার .env ফাইল থেকে পরিবেশ ভেরিয়েবলগুলো লোড করবে
 
@@ -42,6 +48,54 @@ client = AzureOpenAI(
     api_version="2024-05-01-preview",  
 )
 
+# 🔹 কনফিগারেশন
+BASE_PATH = "D:/video_project/"
+OLD_AUDIO_FOLDER = "D:/video_project/old_audio"
+YOUTUBE_URL_FILE = os.path.join(BASE_PATH, "youtube_urls.txt")
+YOUTUBE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_urls.txt")
+# AI ভয়েস ভিডিও URL ফাইল
+YOUTUBE_AI_VOICE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_ai_voice_shorts_urls.txt")
+YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE = os.path.join(BASE_PATH, "youtube_ai_voice_long_video_urls.txt")
+
+AUDIO_FOLDER = os.path.join(BASE_PATH, "audio_files")
+STOCK_VIDEO = os.path.join(BASE_PATH, "stock_video.mp4")  # ফলব্যাক হিসেবে
+OUTPUT_FOLDER = os.path.join(BASE_PATH, "output_videos")
+SHORTS_FOLDER = os.path.join(OUTPUT_FOLDER, "shorts")
+TEMP_FOLDER = os.path.join(BASE_PATH, "temp_output")
+SHORTS_STOCK_VIDEOS_FOLDER = os.path.join(BASE_PATH, "shorts_stock_videos")
+STOCK_VIDEOS_FOLDER = os.path.join(BASE_PATH, "stock_videos")
+BACKGROUND_MUSIC_FOLDER = os.path.join(BASE_PATH, "background_music")
+# কনফিগারেশনে যোগ করুন
+CLONE_AUDIO_FOLDER = os.path.join(BASE_PATH, "clone_audio")
+YOUTUBE_CLONE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_clone_shorts.txt")
+
+
+
+# 🔹 ফেস ফুটেজ ফোল্ডার কনফিগারেশন
+REAL_FOOTAGE_SHORTS_FOLDER = os.path.join(BASE_PATH, "real_footage_shorts")
+REAL_FOOTAGE_LONG_FOLDER = os.path.join(BASE_PATH, "real_footage_long")
+YOUTUBE_SHORTS_WITH_FACE_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_with_5_sec_with_face.txt")
+YOUTUBE_LONG_WITH_FACE_URL_FILE = os.path.join(BASE_PATH, "youtube_long_with_5_sec_with_face.txt")
+YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_with_5_sec_with_face_ai.txt")
+YOUTUBE_LONG_WITH_FACE_AI_URL_FILE = os.path.join(BASE_PATH, "youtube_long_with_5_sec_with_face_ai.txt")
+
+# লগ ফাইলের পাথ
+LOG_FILE = os.path.join(BASE_PATH, "already_done.txt")
+
+# 🔹 Ensure output directories exist
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(SHORTS_FOLDER, exist_ok=True)
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+os.makedirs(SHORTS_STOCK_VIDEOS_FOLDER, exist_ok=True)
+# ফোল্ডার গুলি নিশ্চিত করুন
+os.makedirs(REAL_FOOTAGE_SHORTS_FOLDER, exist_ok=True)
+os.makedirs(REAL_FOOTAGE_LONG_FOLDER, exist_ok=True)
+
+# FaceFootageHandler ইনিশিয়ালাইজ করুন
+face_handler = FaceFootageHandler(BASE_PATH)
+
+os.makedirs(CLONE_AUDIO_FOLDER, exist_ok=True)
 
 # ফাইল নাম সেনিটাইজ করার ফাংশন
 def sanitize_filename(filename):
@@ -113,44 +167,290 @@ def get_original_basename(sanitized_path):
     return os.path.splitext(os.path.basename(original_path))[0]
 
 
-# 🔹 কনফিগারেশন
-BASE_PATH = "G:/video_project/"
-OLD_AUDIO_FOLDER = "G:/video_project/old_audio"
-YOUTUBE_URL_FILE = os.path.join(BASE_PATH, "youtube_urls.txt")
-YOUTUBE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_urls.txt")
-# AI ভয়েস ভিডিও URL ফাইল
-YOUTUBE_AI_VOICE_SHORTS_URL_FILE = os.path.join(BASE_PATH, "youtube_ai_voice_shorts_urls.txt")
-YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE = os.path.join(BASE_PATH, "youtube_ai_voice_long_video_urls.txt")
+def process_single_url(url, url_file):
+    """
+    একটি URL প্রসেস করার পূর্ণাঙ্গ পদ্ধতি
+    """
+    processed_urls = load_processed_urls()
+    
+    # URL ইতিমধ্যে প্রসেস করা হয়েছে কিনা চেক করুন
+    if url in processed_urls:
+        print(f"⏩ URL ইতিমধ্যে প্রসেস করা হয়েছে: {url}")
+        return False
+    
+    try:
+        # URL ডাউনলোড এবং প্রসেসিং
+        temp_url_file = os.path.join(BASE_PATH, f"temp_url_{int(time.time())}.txt")
+        with open(temp_url_file, 'w', encoding='utf-8') as f:
+            f.write(url)
+        
+        # ডাউনলোড এবং প্রসেস
+        audio_files = download_youtube_audio(temp_url_file)
+        
+        if audio_files:
+            # সফল হলে URL লগ ফাইলে যোগ করুন
+            save_processed_url(url)
+            
+            # টেম্পরারি ফাইল মুছে দিন
+            os.remove(temp_url_file)
+            
+            # URL মূল ফাইল থেকে মুছে দিন
+            remove_url_from_file(url, url_file)
+            
+            return True
+        else:
+            print(f"❌ URL প্রসেসিংয়ে ব্যর্থ: {url}")
+            return False
+    
+    except Exception as e:
+        print(f"❌ URL প্রসেসিংয়ে ত্রুটি: {url} - {e}")
+        return False
 
-AUDIO_FOLDER = os.path.join(BASE_PATH, "audio_files")
-STOCK_VIDEO = os.path.join(BASE_PATH, "stock_video.mp4")  # ফলব্যাক হিসেবে
-OUTPUT_FOLDER = os.path.join(BASE_PATH, "output_videos")
-SHORTS_FOLDER = os.path.join(OUTPUT_FOLDER, "shorts")
-TEMP_FOLDER = os.path.join(BASE_PATH, "temp_output")
-SHORTS_STOCK_VIDEOS_FOLDER = os.path.join(BASE_PATH, "shorts_stock_videos")
-STOCK_VIDEOS_FOLDER = os.path.join(BASE_PATH, "stock_videos")
-BACKGROUND_MUSIC_FOLDER = os.path.join(BASE_PATH, "background_music")
-# 🔹 ফেস ফুটেজ ফোল্ডার কনফিগারেশন
-REAL_FOOTAGE_SHORTS_FOLDER = os.path.join(BASE_PATH, "real_footage_shorts")
-REAL_FOOTAGE_LONG_FOLDER = os.path.join(BASE_PATH, "real_footage_long")
-YOUTUBE_SHORTS_WITH_FACE_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_with_5_sec_with_face.txt")
-YOUTUBE_LONG_WITH_FACE_URL_FILE = os.path.join(BASE_PATH, "youtube_long_with_5_sec_with_face.txt")
-YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE = os.path.join(BASE_PATH, "youtube_shorts_with_5_sec_with_face_ai.txt")
-YOUTUBE_LONG_WITH_FACE_AI_URL_FILE = os.path.join(BASE_PATH, "youtube_long_with_5_sec_with_face_ai.txt")
 
-# 🔹 Ensure output directories exist
-os.makedirs(AUDIO_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-os.makedirs(SHORTS_FOLDER, exist_ok=True)
-os.makedirs(TEMP_FOLDER, exist_ok=True)
-os.makedirs(SHORTS_STOCK_VIDEOS_FOLDER, exist_ok=True)
-# ফোল্ডার গুলি নিশ্চিত করুন
-os.makedirs(REAL_FOOTAGE_SHORTS_FOLDER, exist_ok=True)
-os.makedirs(REAL_FOOTAGE_LONG_FOLDER, exist_ok=True)
+def process_long_audio_in_chunks(audio_file, audio_temp_folder, use_ai_voice=False):
+    """
+    দীর্ঘ অডিও ফাইলকে চাঙ্কে ভাগ করে, প্রতিটি চাঙ্কের ব্যাকগ্রাউন্ড মিউজিক রিমুভ করে 
+    এবং তারপর সব চাঙ্ক একত্রিত করে একটি পূর্ণাঙ্গ ফিল্টার করা অডিও ফাইল তৈরি করে।
+    আপডেটেড: বিশেষ পদ্ধতিতে এরর হ্যান্ডলিং ও রিকভারি যোগ করা হয়েছে
+    """
+    audio_name = os.path.splitext(os.path.basename(audio_file))[0]
+    
+    # অডিও দৈর্ঘ্য চেক করুন
+    try:
+        duration_cmd = f'ffprobe -i "{audio_file}" -show_entries format=duration -v quiet -of csv="p=0"'
+        audio_duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+        print(f"📊 Audio duration: {audio_duration:.2f}s ({audio_duration/60:.2f} minutes)")
+        
+        # 10 মিনিটের কম হলে সরাসরি প্রসেস করুন
+        if audio_duration <= 600:  # 10 minutes in seconds
+            print(f"✅ Audio is shorter than 10 minutes, processing directly")
+            filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
+            remove_background_music(audio_file, filtered_audio, audio_temp_folder)
+            
+            # যদি AI ভয়েস ব্যবহার করতে হয়
+            if use_ai_voice:
+                print("🎙️ Transcribing audio for AI voice generation...")
+                transcript = transcribe_audio(filtered_audio)
+                
+                if transcript:
+                    ai_voice_file = transcribe_and_generate_ai_voice(transcript, audio_name, audio_temp_folder)
+                    
+                    if ai_voice_file and os.path.exists(ai_voice_file):
+                        print(f"✅ Using AI voice: {ai_voice_file}")
+                        return ai_voice_file
+                    
+            return filtered_audio
+        
+        # এখানে অডিও চাঙ্কিং করা হবে
+        print("🔄 Audio is longer than 10 minutes, splitting into chunks for processing...")
+        
+        # চাঙ্ক ফোল্ডার তৈরি করুন
+        chunks_folder = os.path.join(audio_temp_folder, "chunks")
+        os.makedirs(chunks_folder, exist_ok=True)
+        
+        # পূর্বের চাঙ্ক সাইজ 300 সেকেন্ড ছিল, এটা আরও কম করে বেশি রিলায়েবল করা হচ্ছে
+        chunk_size = 240  # 4 মিনিট (আগে 5 মিনিট ছিল)
+        
+        # চাঙ্ক সংখ্যা গণনা
+        num_chunks = math.ceil(audio_duration / chunk_size)
+        print(f"🔪 Splitting audio into {num_chunks} chunks of {chunk_size/60:.1f} minutes each")
+        
+        # প্রতিটি চাঙ্ক তৈরি এবং প্রসেস করুন
+        filtered_chunks = []
+        
+        for i in range(num_chunks):
+            start_time = i * chunk_size
+            # শেষ চাঙ্কের জন্য যদি বাকি সময় কম থাকে
+            if i == num_chunks - 1:
+                duration = audio_duration - start_time
+            else:
+                duration = chunk_size
+            
+            # চাঙ্ক ফাইল পাথ
+            chunk_file = os.path.join(chunks_folder, f"chunk_{i+1}.mp3")
+            
+            # ffmpeg দিয়ে চাঙ্ক তৈরি - সর্বোচ্চ 3 বার চেষ্টা করবে
+            max_attempts = 3
+            chunk_success = False
+            
+            for attempt in range(max_attempts):
+                try:
+                    chunk_cmd = f'ffmpeg -i "{audio_file}" -ss {start_time} -t {duration} -c:a libmp3lame -q:a 2 "{chunk_file}" -y'
+                    subprocess.run(chunk_cmd, shell=True, timeout=300)  # 5 মিনিট টাইমআউট
+                    
+                    if os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 1000:  # কমপক্ষে 1KB
+                        chunk_success = True
+                        print(f"✅ Created chunk {i+1}/{num_chunks}: {chunk_file} (Attempt {attempt+1})")
+                        break
+                    else:
+                        print(f"⚠️ Chunk file created but may be invalid: {chunk_file} (Attempt {attempt+1})")
+                except Exception as e:
+                    print(f"⚠️ Error creating chunk {i+1}, attempt {attempt+1}: {e}")
+            
+            if not chunk_success:
+                print(f"❌ Failed to create chunk {i+1} after {max_attempts} attempts, skipping")
+                continue
+            
+            # প্রতিটি চাঙ্কের ব্যাকগ্রাউন্ড মিউজিক রিমুভ করুন
+            filtered_chunk = os.path.join(chunks_folder, f"chunk_{i+1}_filtered.wav")
+            print(f"🔊 Removing background from chunk {i+1}/{num_chunks}")
+            
+            # ব্যাকগ্রাউন্ড রিমুভাল - সর্বোচ্চ 2 বার চেষ্টা করবে
+            filter_success = False
+            for attempt in range(2):
+                try:
+                    remove_background_music(chunk_file, filtered_chunk, chunks_folder)
+                    
+                    if os.path.exists(filtered_chunk) and os.path.getsize(filtered_chunk) > 1000:  # কমপক্ষে 1KB
+                        filtered_chunks.append(filtered_chunk)
+                        print(f"✅ Processed chunk {i+1}/{num_chunks} (Attempt {attempt+1})")
+                        filter_success = True
+                        break
+                except Exception as e:
+                    print(f"⚠️ Error processing chunk {i+1}, attempt {attempt+1}: {e}")
+            
+            # যদি ফিল্টারিং ব্যর্থ হয়, তাহলে অরিজিনাল ফাইল ব্যবহার করুন
+            if not filter_success:
+                print(f"⚠️ Using original chunk without filtering for chunk {i+1}")
+                # অরিজিনাল চাঙ্ক WAV ফরম্যাটে কনভার্ট করুন
+                wav_chunk = os.path.join(chunks_folder, f"chunk_{i+1}_original.wav")
+                try:
+                    convert_cmd = f'ffmpeg -i "{chunk_file}" -c:a pcm_s16le "{wav_chunk}" -y'
+                    subprocess.run(convert_cmd, shell=True)
+                    if os.path.exists(wav_chunk) and os.path.getsize(wav_chunk) > 0:
+                        filtered_chunks.append(wav_chunk)
+                    else:
+                        # এখনও ব্যর্থ হলে, অরিজিনাল MP3 রাখুন
+                        filtered_chunks.append(chunk_file)
+                except:
+                    # কনভার্শন ব্যর্থ হলে, অরিজিনাল রাখুন
+                    filtered_chunks.append(chunk_file)
+        
+        # যদি কোনো চাঙ্ক প্রসেস না হয়
+        if not filtered_chunks:
+            print("❌ No chunks were successfully processed")
+            print("⚠️ Falling back to original audio file")
+            # ফলব্যাক হিসেবে অরিজিনাল অডিও রিটার্ন করুন
+            return audio_file
+        
+        # এখন সব ফিল্টার করা চাঙ্ক একত্রিত করুন একটি সিঙ্গেল অডিও ফাইলে
+        print("\n🔄 Combining all filtered chunks into a single audio file...")
+        
+        # ffmpeg concat ফিল্টার ব্যবহার করে চাঙ্ক একত্রিত করুন
+        concat_list_file = os.path.join(chunks_folder, "concat_list.txt")
+        with open(concat_list_file, "w", encoding="utf-8") as f:
+            for chunk in filtered_chunks:
+                f.write(f"file '{os.path.abspath(chunk)}'\n")
+        
+        # ফিল্টার করা সম্পূর্ণ অডিও ফাইল
+        final_filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered_combined.wav")
+        
+        # ffmpeg দিয়ে সব চাঙ্ক একত্রিত করুন - সর্বোচ্চ 3 বার চেষ্টা করবে
+        concat_success = False
+        for attempt in range(3):
+            try:
+                concat_cmd = f'ffmpeg -f concat -safe 0 -i "{concat_list_file}" -c:a pcm_s24le -ar 48000 "{final_filtered_audio}" -y'
+                subprocess.run(concat_cmd, shell=True, timeout=600)  # 10 মিনিট টাইমআউট
+                
+                if os.path.exists(final_filtered_audio) and os.path.getsize(final_filtered_audio) > 10000:  # কমপক্ষে 10KB
+                    concat_success = True
+                    print(f"✅ Successfully combined all filtered chunks into: {final_filtered_audio} (Attempt {attempt+1})")
+                    break
+                else:
+                    print(f"⚠️ Combined file created but may be invalid (Attempt {attempt+1})")
+            except Exception as e:
+                print(f"⚠️ Error combining chunks, attempt {attempt+1}: {e}")
+        
+        if concat_success:
+            # যদি AI ভয়েস ব্যবহার করতে হয়
+            if use_ai_voice:
+                print("🎙️ Transcribing combined audio for AI voice generation...")
+                transcript = transcribe_audio(final_filtered_audio)
+                
+                if transcript:
+                    ai_voice_file = transcribe_and_generate_ai_voice(transcript, audio_name, audio_temp_folder)
+                    
+                    if ai_voice_file and os.path.exists(ai_voice_file):
+                        print(f"✅ Using AI voice: {ai_voice_file}")
+                        return ai_voice_file
+            
+            return final_filtered_audio
+        else:
+            print("❌ Failed to combine filtered chunks after multiple attempts")
+            # যদি একত্রিত করা ব্যর্থ হয়, তবে শুধু প্রথম চাঙ্ক রিটার্ন করুন
+            if filtered_chunks:
+                print("⚠️ Returning only the first filtered chunk as fallback")
+                return filtered_chunks[0]
+            
+            print("⚠️ Returning original audio file as ultimate fallback")
+            return audio_file
+    
+    except Exception as e:
+        print(f"❌ Error processing long audio in chunks: {e}")
+        print("⚠️ Returning original audio file as fallback")
+        return audio_file  # মূল অডিও ফাইল রিটার্ন করুন
 
-# FaceFootageHandler ইনিশিয়ালাইজ করুন
-face_handler = FaceFootageHandler(BASE_PATH)
+def split_audio_into_chunks(audio_file, max_duration=600, temp_folder=None):
+    """
+    দীর্ঘ অডিও ফাইলকে নির্দিষ্ট দৈর্ঘ্যের চাঙ্কে ভাগ করে। 
+    max_duration: প্রতি চাঙ্কের সর্বোচ্চ দৈর্ঘ্য (সেকেন্ডে)
+    """
+    if not temp_folder:
+        temp_folder = TEMP_FOLDER
+    
+    # অডিওর ফাইলনাম থেকে বেস নাম পাই
+    base_name = os.path.splitext(os.path.basename(audio_file))[0]
+    
+    # অডিও চাঙ্কের জন্য একটি ফোল্ডার তৈরি করি
+    chunks_folder = os.path.join(temp_folder, f"{base_name}_chunks")
+    os.makedirs(chunks_folder, exist_ok=True)
 
+    # অডিও দৈর্ঘ্য চেক করি
+    try:
+        duration_cmd = f'ffprobe -i "{audio_file}" -show_entries format=duration -v quiet -of csv="p=0"'
+        duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+        print(f"📊 Audio duration: {duration:.2f}s ({duration/60:.2f} minutes)")
+        
+        # যদি অডিও দৈর্ঘ্য max_duration এর চেয়ে কম হয়, তবে চাঙ্কিং দরকার নেই
+        if duration <= max_duration:
+            print(f"✅ Audio is shorter than the maximum chunk size, no need to split")
+            return [audio_file]
+        
+        # চাঙ্ক সংখ্যা গণনা করি
+        num_chunks = math.ceil(duration / max_duration)
+        print(f"🔪 Splitting audio into {num_chunks} chunks of max {max_duration/60:.2f} minutes each")
+        
+        chunk_files = []
+        
+        # প্রতিটি চাঙ্ক তৈরি করি
+        for i in range(num_chunks):
+            start_time = i * max_duration
+            chunk_file = os.path.join(chunks_folder, f"{base_name}_chunk_{i+1}.mp3")
+            
+            # যদি এটি শেষ চাঙ্ক হয়, তবে শুধু শেষ অবধি নিই
+            if i == num_chunks - 1:
+                # শেষ চাঙ্কের জন্য ffmpeg কমান্ড
+                chunk_cmd = f'ffmpeg -i "{audio_file}" -ss {start_time} -c:a libmp3lame -q:a 2 "{chunk_file}" -y'
+            else:
+                # মাঝখানের চাঙ্কের জন্য ffmpeg কমান্ড
+                chunk_cmd = f'ffmpeg -i "{audio_file}" -ss {start_time} -t {max_duration} -c:a libmp3lame -q:a 2 "{chunk_file}" -y'
+            
+            # ffmpeg কমান্ড চালাই
+            subprocess.run(chunk_cmd, shell=True)
+            
+            # যদি চাঙ্ক ফাইল সফলভাবে তৈরি হয়, তবে তালিকায় যোগ করি
+            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 0:
+                chunk_files.append(chunk_file)
+                print(f"✅ Created chunk {i+1}/{num_chunks}: {chunk_file}")
+            else:
+                print(f"❌ Failed to create chunk {i+1}/{num_chunks}")
+        
+        return chunk_files
+        
+    except Exception as e:
+        print(f"❌ Error splitting audio into chunks: {e}")
+        return [audio_file]  # সমস্যা হলে মূল ফাইল ফেরত দিই
+    
 def transcribe_audio(audio_file):
     """স্পিচ টু টেক্সট প্রসেস করা Whisper দিয়ে"""
     result = model.transcribe(audio_file, task='transcribe')
@@ -261,15 +561,46 @@ def process_audio_and_generate_text(audio_file, video_title, is_short=False):
     print(f"✅ Video and text saved to: {video_folder}")
 
 
-def get_random_file(folder_path, extensions=(".mp4", ".mov", ".mp3", ".wav")):
-    """ফোল্ডার থেকে নির্দিষ্ট এক্সটেনশনের র্যান্ডম ফাইল পেতে সাহায্য করে।"""
-    if not os.path.isdir(folder_path):
-        return None
-    file_list = [f for f in glob(os.path.join(folder_path, "*")) if f.lower().endswith(extensions)]
-    if file_list:
-        return random.choice(file_list)
-    return None
+# ফাইল ব্যবহারের ট্র্যাকিং রাখার জন্য ডিকশনারি
+file_usage_count = {}
 
+def get_random_file(folder_path, extensions=(".mp4", ".mov", ".mp3", ".wav")):
+    """ফোল্ডার থেকে সবচেয়ে কম ব্যবহৃত ফাইল নির্বাচন করে।"""
+    global file_usage_count
+    
+    print(f"🔍 Checking folder: {folder_path}")
+    if not os.path.isdir(folder_path):
+        print(f"❌ Folder does not exist: {folder_path}")
+        return None
+        
+    file_list = [f for f in glob(os.path.join(folder_path, "*")) if f.lower().endswith(extensions)]
+    
+    print(f"📋 Found {len(file_list)} files with extensions {extensions}")
+    print(f"📄 Files: {[os.path.basename(f) for f in file_list]}")
+    
+    if not file_list:
+        print(f"❌ No matching files found in folder")
+        return None
+    
+    # সব ফাইলের ব্যবহার কাউন্ট চেক করুন
+    # যদি ফাইল আগে ব্যবহার না হয়ে থাকে, তার কাউন্ট 0 ধরে নিন
+    for file in file_list:
+        if file not in file_usage_count:
+            file_usage_count[file] = 0
+    
+    # সবচেয়ে কম ব্যবহৃত ফাইলগুলি খুঁজুন
+    min_usage = min(file_usage_count[file] for file in file_list)
+    least_used_files = [file for file in file_list if file_usage_count[file] == min_usage]
+    
+    # সবচেয়ে কম ব্যবহৃত ফাইলগুলি থেকে র‍্যান্ডমলি একটি নির্বাচন করুন
+    selected_file = random.choice(least_used_files)
+    
+    # নির্বাচিত ফাইলের ব্যবহার কাউন্ট বাড়ান
+    file_usage_count[selected_file] += 1
+    
+    print(f"✅ Selected file: {os.path.basename(selected_file)} (used {file_usage_count[selected_file]} times)")
+    
+    return selected_file
 
 # আউটপুট ভিডিও ফাইলের নাম তৈরি করতে ফাইলের নামকে অডিও ফাইলের নাম অনুযায়ী সেট করুন
 def get_output_filename(audio_file, is_short=False, prefix='', suffix=''):
@@ -299,8 +630,16 @@ def get_output_filename(audio_file, is_short=False, prefix='', suffix=''):
     return output_filename
 
 
-def convert_srt_to_ass(srt_file, ass_file, is_short=False):
+def convert_srt_to_ass(srt_file, ass_file, is_short=False, position='bottom'):
     """Convert SRT subtitles to ASS format with premium styling and random color patterns."""
+    """
+    position এর অপশন হতে পারে:
+    - 'top'
+    - 'bottom' (default)
+    - 'left'
+    - 'right'
+    - 'center'
+    """
     try:
         # ফাইলনাম এক্সট্রাক্ট করুন
         base_filename = os.path.basename(srt_file)
@@ -308,6 +647,18 @@ def convert_srt_to_ass(srt_file, ass_file, is_short=False):
         print(f"\n🎨 Creating design for: {base_filename}")
         
         subs = pysubs2.load(srt_file, encoding="utf-8")
+        
+         # পজিশন অনুযায়ী alignment সেট করুন
+        if position == 'top':
+            subs.styles["Default"].alignment = 8  # Top
+        elif position == 'bottom':
+            subs.styles["Default"].alignment = 2  # Bottom
+        elif position == 'left':
+            subs.styles["Default"].alignment = 4  # Left
+        elif position == 'right':
+            subs.styles["Default"].alignment = 6  # Right
+        else:  # center
+            subs.styles["Default"].alignment = 5  # Center
         
         # ডিজাইন অ্যাপ্লাই করুন, ফাইলনাম পাস করুন যাতে একই ফাইলে সবসময় একই ডিজাইন হয়
         subs = apply_design(subs, is_short, filename=base_filename)
@@ -347,62 +698,288 @@ def shorten_filename(filename, length=10):
     return f"{short_name}_{''.join(random.choices(string.ascii_letters + string.digits, k=5))}"
 
 def download_youtube_audio(url_file):
-    """Download YouTube audio as MP3 and sanitize filenames."""
+    """
+    Download YouTube audio as MP3 and sanitize filenames.
+    আপডেটেড: এরর হ্যান্ডলিং যোগ করা হয়েছে, একইসাথে একাধিক ইউটিউব লিংকে সমস্যা এড়ানো হয়েছে।
+    """
     if not os.path.isfile(url_file):
+        print(f"❌ URL ফাইল নেই: {url_file}")
         return []
-    with open(url_file, "r", encoding="utf-8") as file:
-        urls = [line.strip() for line in file.readlines() if line.strip()]
+        
+    # ফাইল থেকে URL গুলো লোড করুন
+    try:
+        with open(url_file, "r", encoding="utf-8") as file:
+            urls = [line.strip() for line in file.readlines() if line.strip()]
+    except Exception as e:
+        print(f"❌ URL ফাইল পড়তে সমস্যা: {url_file} - {e}")
+        return []
+        
     if not urls:
+        print(f"⚠️ URL ফাইলে কোনো লিংক নেই: {url_file}")
         return []
 
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'outtmpl': os.path.join(AUDIO_FOLDER, '%(title)s.%(ext)s'),
-        'noplaylist': True,
-    }
+    print(f"📋 {len(urls)}টি লিংক পাওয়া গেছে ফাইল থেকে: {url_file}")
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download(urls)
+    # সফল ডাউনলোড করা ফাইলগুলো সংরক্ষণের জন্য লিস্ট
+    downloaded_files = []
     
-    # ডাউনলোড করা ফাইলগুলো সংগ্রহ করুন
-    downloaded_files = glob(os.path.join(AUDIO_FOLDER, "*.mp3"))
-    sanitized_files = []
-    
-    # প্রতিটি ফাইলের নাম সেনিটাইজ করুন
-    for file_path in downloaded_files:
-        file_dir = os.path.dirname(file_path)
-        file_name = os.path.basename(file_path)
+    # প্রতিটি URL একে একে প্রসেস করুন (একসাথে সবগুলো করলে এরর হতে পারে)
+    for idx, url in enumerate(urls, 1):
+        print(f"\n🔄 প্রসেসিং URL {idx}/{len(urls)}: {url}")
         
-        # ফাইল নাম সেনিটাইজ করুন
-        sanitized_name, original_name = sanitize_filename(file_name)
-        sanitized_path = os.path.join(file_dir, sanitized_name)
+        # এই URL এর জন্য অস্থায়ী ফোল্ডার তৈরি করুন
+        temp_download_folder = os.path.join(TEMP_FOLDER, f"download_{int(time.time())}_{idx}")
+        os.makedirs(temp_download_folder, exist_ok=True)
         
-        # যদি ফাইলনাম পরিবর্তন হয়ে থাকে, তাহলে রিনেম করুন
-        if sanitized_name != file_name:
+        # yt-dlp কনফিগারেশন 
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(temp_download_folder, '%(title)s.%(ext)s'),
+            'noplaylist': True,
+            'quiet': False,
+            'no_warnings': False
+        }
+        
+        # এই URL ডাউনলোড করার চেষ্টা করুন
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                video_title = info.get('title', f"video_{idx}")
+                print(f"🎬 ডাউনলোড করা হচ্ছে: {video_title}")
+                ydl.download([url])
+            
+            # ডাউনলোড করা ফাইল খুঁজুন
+            temp_files = glob(os.path.join(temp_download_folder, "*.mp3"))
+            
+            if not temp_files:
+                print(f"⚠️ ডাউনলোড হয়েছে কিন্তু ফাইল পাওয়া যায়নি: {temp_download_folder}")
+                continue
+                
+            # প্রথম ফাইল নিন (সাধারণত একটাই থাকে)
+            downloaded_file = temp_files[0]
+            
+            # ফাইল অডিও ফোল্ডারে মুভ করুন এবং নাম সেনিটাইজ করুন
+            file_name = os.path.basename(downloaded_file)
+            sanitized_name, original_name = sanitize_filename(file_name)
+            
+            # অডিও ফোল্ডারে আছে কিনা চেক করুন
+            target_path = os.path.join(AUDIO_FOLDER, sanitized_name)
+            if os.path.exists(target_path):
+                print(f"⚠️ ফাইল ইতিমধ্যে বিদ্যমান: {target_path}")
+                # ইউনিক নাম তৈরি করুন
+                base_name, ext = os.path.splitext(sanitized_name)
+                sanitized_name = f"{base_name}_{int(time.time())}{ext}"
+                target_path = os.path.join(AUDIO_FOLDER, sanitized_name)
+                
+            # ফাইল মুভ করুন
             try:
-                # ফাইল রিনেম করুন
-                os.rename(file_path, sanitized_path)
-                print(f"✅ Renamed: {file_name} -> {sanitized_name}")
+                shutil.move(downloaded_file, target_path)
+                print(f"✅ ফাইল সফলভাবে সংরক্ষিত হয়েছে: {sanitized_name}")
                 
                 # ম্যাপিং সংরক্ষণ করুন
-                map_filename(file_path, sanitized_path)
-                sanitized_files.append(sanitized_path)
+                map_filename(original_name, target_path)
+                downloaded_files.append(target_path)
+                
             except Exception as e:
-                print(f"❌ Error renaming file {file_name}: {e}")
-                sanitized_files.append(file_path)  # অরিজিনাল ফাইল ব্যবহার করুন
-        else:
-            # ফাইলনাম পরিবর্তন না হলেও ম্যাপিং রাখুন
-            map_filename(file_path, file_path)
-            sanitized_files.append(file_path)
+                print(f"❌ ফাইল মুভ করতে সমস্যা: {e}")
+                
+            # অস্থায়ী ফোল্ডার পরিষ্কার করুন
+            try:
+                shutil.rmtree(temp_download_folder)
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"❌ URL ডাউনলোড করতে সমস্যা: {url} - {e}")
+            print("⚠️ এই URL-টি এড়িয়ে পরবর্তী URL প্রসেস করা হচ্ছে...")
+            
+            # অস্থায়ী ফোল্ডার পরিষ্কার করুন
+            try:
+                shutil.rmtree(temp_download_folder)
+            except:
+                pass
     
-    print(f"✅ YouTube MP3 Download Complete from {url_file}!")
-    return sanitized_files
+    print(f"✅ মোট {len(downloaded_files)}টি ফাইল সফলভাবে ডাউনলোড করা হয়েছে {url_file} থেকে!")
+    return downloaded_files
 
+
+def load_processed_urls():
+    """
+    ইতিমধ্যে প্রসেস করা URLs গুলো লোড করুন
+    """
+    processed_urls = set()
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                processed_urls = set(line.strip() for line in f if line.strip())
+        except Exception as e:
+            print(f"❌ লগ ফাইল পড়তে সমস্যা: {e}")
+    return processed_urls
+
+def save_processed_url(url):
+    """
+    URL কে log ফাইলে সংরক্ষণ করুন
+    """
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{url}\n")
+        print(f"✅ URL লগ ফাইলে সংরক্ষিত হয়েছে: {url}")
+    except Exception as e:
+        print(f"❌ URL লগ ফাইলে সংরক্ষণ করতে সমস্যা: {e}")
+
+def remove_url_from_file(url, file_path):
+    """
+    URL টিকে মূল URL ফাইল থেকে মুছে দিন
+    """
+    try:
+        # ফাইল পড়ুন
+        with open(file_path, 'r', encoding='utf-8') as f:
+            urls = f.readlines()
+        
+        # URL বাদ দিন (স্ট্রিংয়ের মাঝের স্পেস এবং লাইন ব্রেক ট্রিম করে)
+        urls = [u for u in urls if u.strip() != url.strip()]
+        
+        # ফাইলে আবার লিখুন
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.writelines(urls)
+        
+        print(f"✅ URL মুছে দেওয়া হয়েছে: {url}")
+    except Exception as e:
+        print(f"❌ URL মুছতে সমস্যা: {url} - {e}")
+
+def process_all_url_files():
+    """
+    URL ফাইলগুলো 1 by 1 প্রসেস করবে
+    """
+    # ইতিমধ্যে প্রসেসকৃত URLs লোড করুন
+    processed_urls = load_processed_urls()
+
+    # URL ফাইলগুলো
+    url_files = [
+        YOUTUBE_SHORTS_WITH_FACE_URL_FILE,
+        YOUTUBE_LONG_WITH_FACE_URL_FILE,
+        YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE,
+        YOUTUBE_LONG_WITH_FACE_AI_URL_FILE,
+        YOUTUBE_AI_VOICE_SHORTS_URL_FILE,
+        YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE,
+        YOUTUBE_URL_FILE,
+        YOUTUBE_SHORTS_URL_FILE
+    ]
+
+    # প্রতিটি URL ফাইল প্রসেস করা
+    for file_path in url_files:
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            print(f"⚠️ ফাইল খালি বা নেই: {file_path}")
+            continue
+
+        # ফাইল থেকে URLs পড়ুন
+        with open(file_path, 'r', encoding='utf-8') as f:
+            urls = [line.strip() for line in f if line.strip()]
+
+        print(f"\n🔍 {file_path} থেকে {len(urls)}টি URL প্রসেস করা হচ্ছে")
+
+        # URLs গুলো 1 by 1 প্রসেস করুন
+        for url in urls:
+            # ইতিমধ্যে প্রসেস করা হয়েছে কিনা চেক করুন
+            if url in processed_urls:
+                print(f"⏩ URL ইতিমধ্যে প্রসেস করা হয়েছে: {url}")
+                continue
+
+            # URL কনফিগারেশন নির্ধারণ
+            is_short = file_path in [
+                YOUTUBE_SHORTS_WITH_FACE_URL_FILE, 
+                YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE, 
+                YOUTUBE_AI_VOICE_SHORTS_URL_FILE, 
+                YOUTUBE_SHORTS_URL_FILE
+            ]
+
+            use_ai_voice = file_path in [
+                YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE, 
+                YOUTUBE_LONG_WITH_FACE_AI_URL_FILE, 
+                YOUTUBE_AI_VOICE_SHORTS_URL_FILE, 
+                YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE
+            ]
+
+            use_face_footage = file_path in [
+                YOUTUBE_SHORTS_WITH_FACE_URL_FILE, 
+                YOUTUBE_LONG_WITH_FACE_URL_FILE, 
+                YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE, 
+                YOUTUBE_LONG_WITH_FACE_AI_URL_FILE
+            ]
+
+            print(f"\n===== URL প্রসেসিং: {url} =====")
+            print(f"⚙️ কনফিগারেশন: শর্টস={is_short}, AI ভয়েস={use_ai_voice}, ফেস ফুটেজ={use_face_footage}")
+
+            # URL ফাইল তৈরি করে প্রসেস করুন
+            temp_url_file = os.path.join(BASE_PATH, f"temp_url_{int(time.time())}.txt")
+            with open(temp_url_file, 'w', encoding='utf-8') as f:
+                f.write(url)
+
+            try:
+                # ডাউনলোড এবং প্রসেস
+                audio_files = download_youtube_audio(temp_url_file)
+                
+                if not audio_files:
+                    print(f"❌ {url} থেকে কোনো অডিও ফাইল ডাউনলোড হয়নি")
+                    
+                    # URL কে log ফাইলে যোগ করুন
+                    save_processed_url(url)
+                    
+                    # URL টিকে মূল ফাইল থেকে মুছে দিন
+                    remove_url_from_file(url, file_path)
+                    
+                    # টেম্পরারি URL ফাইল মুছে দিন
+                    os.remove(temp_url_file)
+                    
+                    continue
+
+                print(f"✅ {len(audio_files)}টি অডিও ফাইল ডাউনলোড সম্পন্ন হয়েছে")
+
+                # প্রতিটি অডিও ফাইল প্রসেস করুন
+                for audio_file in audio_files:
+                    video_title = os.path.splitext(os.path.basename(audio_file))[0]
+                    print(f"\n🎵 অডিও প্রসেসিং: {video_title}")
+
+                    # ভিডিও তৈরি
+                    success = process_audio_in_parallel(
+                        audio_file, 
+                        is_short=is_short, 
+                        use_ai_voice=use_ai_voice, 
+                        use_face_footage=use_face_footage
+                    )
+
+                    if success:
+                        print(f"✅ সফলভাবে ভিডিও তৈরি হয়েছে: {video_title}")
+                        
+                        # URL কে log ফাইলে যোগ করুন
+                        save_processed_url(url)
+                        
+                        # URL টিকে মূল ফাইল থেকে মুছে দিন
+                        remove_url_from_file(url, file_path)
+                    else:
+                        print(f"❌ ভিডিও তৈরি করতে ব্যর্থ: {video_title}")
+
+                # টেম্পরারি URL ফাইল মুছে দিন
+                os.remove(temp_url_file)
+
+            except Exception as e:
+                print(f"❌ URL প্রসেসিং এরর: {url} - {e}")
+                
+                # URL কে log ফাইলে যোগ করুন
+                save_processed_url(url)
+                
+                # URL টিকে মূল ফাইল থেকে মুছে দিন
+                remove_url_from_file(url, file_path)
+                
+                # টেম্পরারি URL ফাইল মুছে দিন
+                os.remove(temp_url_file)
+
+    print("\n🎉 সব URL ফাইল প্রসেসিং সম্পন্ন!")
 # remove_background_music ফাংশনটি পরিবর্তন করুন
 def remove_background_music(input_audio, output_audio, temp_folder):
     """
@@ -428,6 +1005,17 @@ def remove_background_music(input_audio, output_audio, temp_folder):
         try:
             # Spleeter কমান্ড চালান
             spleeter_cmd = f'spleeter separate -o "{spleeter_output}" -p spleeter:2stems "{input_audio}"'
+            
+            # Spleeter এর পরে অতিরিক্ত পোস্ট-প্রসেসিং যোগ করুন:
+            enhance_cmd = (
+                f'ffmpeg -i "{vocals_path}" -af "equalizer=f=1000:width_type=o:width=1:g=2,' 
+                f'equalizer=f=3000:width_type=o:width=1:g=3,' 
+                f'equalizer=f=6000:width_type=o:width=1:g=1,' 
+                f'loudnorm=I=-14:TP=-1.5:LRA=11,' 
+                f'volume=1.2" '
+                f'-c:a pcm_s24le -ar 48000 "{output_audio}" -y'
+            )
+            
             print("Running Spleeter for voice separation...")
             subprocess.run(spleeter_cmd, shell=True, timeout=300)  # 5 মিনিট টাইমআউট
             
@@ -438,7 +1026,7 @@ def remove_background_music(input_audio, output_audio, temp_folder):
             if os.path.exists(vocals_path):
                 # ভয়েস কোয়ালিটি উন্নত করুন
                 enhance_cmd = (
-                    f'ffmpeg -i "{vocals_path}" -af "volume=1.8, ' 
+                    f'ffmpeg -i "{vocals_path}" -af "volume=1.5, ' 
                     f'compand=attacks=0.01:decays=0.1:points=-80/-80|-45/-45|-27/-25|-15/-10|-5/-2|0/0|20/8" '
                     f'-c:a pcm_s16le "{output_audio}" -y'
                 )
@@ -456,18 +1044,17 @@ def remove_background_music(input_audio, output_audio, temp_folder):
         # যদি Spleeter ব্যর্থ হয়, তাহলে FFmpeg ফিল্টার ব্যবহার করুন
         # উন্নত FFmpeg অডিও ফিল্টার
         audio_filter = (
-            "highpass=f=80, " +           # নিচু আওয়াজ বাদ দিন
-            "lowpass=f=8000, " +          # উচ্চ আওয়াজ বাদ দিন
-            "volume=2.0, " +              # ভলিউম বাড়ান
-            "compand=attacks=0.01:decays=0.1:" +  # ডাইনামিক কম্প্রেশন
-            "points=-80/-80|-45/-45|-27/-25|-15/-10|-5/-2|0/0|20/8"
+            "highpass=f=60, " +           # নিচু আওয়াজ বাদ দিন
+            "lowpass=f=12000, " +          # উচ্চ আওয়াজ বাদ দিন
+            "volume=1.5, " +              # ভলিউম বাড়ান
+            "compand=attacks=0.02:decays=0.2:" +  # ডাইনামিক কম্প্রেশন
+            "points=-70/-70|-40/-40|-25/-24|-15/-12|-5/-5|0/0|15/7"
         )
         
         ffmpeg_cmd = (
             f'ffmpeg -i "{input_audio}" -af "{audio_filter}" '
-            f'-c:a pcm_s16le "{output_audio}" -y'
+            f'-c:a pcm_s24le -ar 48000 "{output_audio}" -y'  # ইম্প্রুভড বিট ডেপথ ও স্যাম্পলিং রেট
         )
-        
         print(f"Running FFmpeg audio enhancement command...")
         subprocess.run(ffmpeg_cmd, shell=True)
         
@@ -497,7 +1084,171 @@ def remove_background_music(input_audio, output_audio, temp_folder):
             print(f"✅ File copied as fallback: {output_audio}")
         except Exception as copy_error:
             print(f"❌ Even fallback copy failed: {copy_error}")
-                       
+
+def process_long_audio_with_chunked_transcription(audio_file, audio_temp_folder):
+    """
+    দীর্ঘ অডিও ফাইলকে চাংকে ভাগ করে, প্রতিটি চাংকের
+    1. ব্যাকগ্রাউন্ড মিউজিক রিমুভ করে
+    2. প্রতিটি চাংক আলাদাভাবে ট্রান্সক্রাইব করে
+    3. সব ট্রান্সক্রিপ্ট একত্রিত করে
+    4. একত্রিত ট্রান্সক্রিপ্ট থেকে AI ভয়েস তৈরি করে
+    
+    এটি শুধুমাত্র AI ভয়েস ফিচারের জন্য ব্যবহার করুন
+    
+    Returns:
+        str: AI ভয়েস অডিও ফাইলের পাথ, ব্যর্থ হলে None
+    """
+    audio_name = os.path.splitext(os.path.basename(audio_file))[0]
+    
+    # অডিও দৈর্ঘ্য চেক করুন
+    try:
+        duration_cmd = f'ffprobe -i "{audio_file}" -show_entries format=duration -v quiet -of csv="p=0"'
+        audio_duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+        print(f"📊 Audio duration: {audio_duration:.2f}s ({audio_duration/60:.2f} minutes)")
+        
+        # 10 মিনিটের কম হলে চাংকিং প্রয়োজন নেই
+        if audio_duration <= 600:
+            print(f"✅ Audio is shorter than 10 minutes, processing without chunking")
+            filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
+            remove_background_music(audio_file, filtered_audio, audio_temp_folder)
+            
+            # সম্পূর্ণ ফাইল ট্রান্সক্রাইব করুন
+            transcript = transcribe_audio(filtered_audio)
+            
+            if transcript:
+                print(f"✅ Transcription successful: {len(transcript.split())} words")
+                ai_voice_file = transcribe_and_generate_ai_voice(transcript, audio_name, audio_temp_folder)
+                
+                if ai_voice_file and os.path.exists(ai_voice_file):
+                    print(f"✅ Using AI voice: {ai_voice_file}")
+                    return ai_voice_file
+            
+            return None
+        
+        # এখানে অডিও চাংকিং করা হবে
+        print("🔄 Audio is longer than 10 minutes, using chunked transcription...")
+        
+        # চাংক ফোল্ডার তৈরি করুন
+        chunks_folder = os.path.join(audio_temp_folder, "chunks")
+        os.makedirs(chunks_folder, exist_ok=True)
+        
+        # উন্নত - চাংক সাইজ কমিয়ে আনুন ট্রান্সক্রিপশন এক্যুরেসির জন্য
+        chunk_size = 180  # 3 মিনিট (আগের থেকে আরও কম)
+        
+        # চাংক সংখ্যা গণনা
+        num_chunks = math.ceil(audio_duration / chunk_size)
+        print(f"🔪 Splitting audio into {num_chunks} chunks of {chunk_size/60:.1f} minutes each")
+        
+        # প্রতিটি চাংক তৈরি, প্রসেস, এবং ট্রান্সক্রাইব
+        all_transcripts = []
+        
+        for i in range(num_chunks):
+            start_time = i * chunk_size
+            
+            # শেষ চাংকের জন্য যদি বাকি সময় কম থাকে
+            if i == num_chunks - 1:
+                duration = audio_duration - start_time
+            else:
+                duration = chunk_size
+            
+            print(f"\n--- Processing Chunk {i+1}/{num_chunks} (Duration: {duration:.1f}s) ---")
+            
+            # চাংক ফাইল পাথ
+            chunk_file = os.path.join(chunks_folder, f"chunk_{i+1}.mp3")
+            
+            # ffmpeg দিয়ে চাংক তৈরি - সর্বোচ্চ 3 বার চেষ্টা করবে
+            max_attempts = 3
+            chunk_success = False
+            
+            for attempt in range(max_attempts):
+                try:
+                    chunk_cmd = f'ffmpeg -i "{audio_file}" -ss {start_time} -t {duration} -c:a libmp3lame -q:a 2 "{chunk_file}" -y'
+                    subprocess.run(chunk_cmd, shell=True, timeout=300)
+                    
+                    if os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 1000:
+                        chunk_success = True
+                        print(f"✅ Created chunk {i+1}/{num_chunks} (Attempt {attempt+1})")
+                        break
+                except Exception as e:
+                    print(f"⚠️ Error creating chunk {i+1}, attempt {attempt+1}: {e}")
+            
+            if not chunk_success:
+                print(f"❌ Failed to create chunk {i+1} after {max_attempts} attempts, skipping")
+                continue
+            
+            # প্রতিটি চাংকের ব্যাকগ্রাউন্ড মিউজিক রিমুভ করুন
+            filtered_chunk = os.path.join(chunks_folder, f"chunk_{i+1}_filtered.wav")
+            print(f"🔊 Removing background from chunk {i+1}/{num_chunks}")
+            
+            # ব্যাকগ্রাউন্ড রিমুভাল - সর্বোচ্চ 2 বার চেষ্টা
+            filter_success = False
+            for attempt in range(2):
+                try:
+                    remove_background_music(chunk_file, filtered_chunk, chunks_folder)
+                    
+                    if os.path.exists(filtered_chunk) and os.path.getsize(filtered_chunk) > 1000:
+                        filter_success = True
+                        print(f"✅ Filtered chunk {i+1}/{num_chunks} (Attempt {attempt+1})")
+                        break
+                except Exception as e:
+                    print(f"⚠️ Error filtering chunk {i+1}, attempt {attempt+1}: {e}")
+            
+            # ফিল্টার ব্যর্থ হলে অরিজিনাল ব্যবহার করুন
+            if not filter_success:
+                print(f"⚠️ Using original chunk without filtering for chunk {i+1}")
+                # অরিজিনাল চাংক WAV ফরম্যাটে কনভার্ট করুন
+                wav_chunk = os.path.join(chunks_folder, f"chunk_{i+1}_original.wav")
+                try:
+                    convert_cmd = f'ffmpeg -i "{chunk_file}" -c:a pcm_s16le "{wav_chunk}" -y'
+                    subprocess.run(convert_cmd, shell=True)
+                    if os.path.exists(wav_chunk) and os.path.getsize(wav_chunk) > 0:
+                        filtered_chunk = wav_chunk
+                    else:
+                        filtered_chunk = chunk_file
+                except:
+                    filtered_chunk = chunk_file
+            
+            # ৩. এখানে প্রতিটি চাংক আলাদা আলাদা ট্রান্সক্রাইব করুন
+            print(f"🎙️ Transcribing chunk {i+1}/{num_chunks}...")
+            chunk_transcript = transcribe_audio(filtered_chunk)
+            
+            if chunk_transcript:
+                print(f"✅ Chunk {i+1} transcription successful: {len(chunk_transcript.split())} words")
+                # শুরুতে চাংক নম্বর যোগ করুন - পরে ডিবাগিং এর জন্য
+                chunk_transcript = f"[Chunk {i+1}] {chunk_transcript}"
+                all_transcripts.append(chunk_transcript)
+            else:
+                print(f"❌ Chunk {i+1} transcription failed")
+        
+        # যদি কোনো চাংক ট্রান্সক্রাইব না হয়
+        if not all_transcripts:
+            print("❌ No chunks were successfully transcribed")
+            return None
+        
+        # ৪. সব ট্রান্সক্রিপ্ট একত্রিত করুন
+        full_transcript = " ".join(all_transcripts)
+        print(f"\n✅ Combined all transcripts: {len(full_transcript.split())} words total")
+        
+        # ট্রান্সক্রিপ্ট ফাইলে সংরক্ষণ করুন (ঐচ্ছিক - ডিবাগিং এর জন্য)
+        transcript_file = os.path.join(audio_temp_folder, f"{audio_name}_transcript.txt")
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.write(full_transcript)
+        
+        # ৫. AI ভয়েস জেনারেট করুন
+        print(f"🎙️ Generating AI voice from combined transcript...")
+        ai_voice_file = transcribe_and_generate_ai_voice(full_transcript, audio_name, audio_temp_folder)
+        
+        if ai_voice_file and os.path.exists(ai_voice_file):
+            print(f"✅ AI voice generation successful: {ai_voice_file}")
+            return ai_voice_file
+        else:
+            print(f"❌ AI voice generation failed")
+            return None
+        
+    except Exception as e:
+        print(f"❌ Error in chunked transcription process: {e}")
+        return None
+
 def split_into_chunks(result, words_per_line=5):
     """
     Whisper result ডেটা থেকে (word_timestamps=True) প্রতিটি ওয়ার্ড নিয়ে 
@@ -536,7 +1287,7 @@ def split_into_chunks(result, words_per_line=5):
 
     return all_chunks
 
-def color_line_dynamically(line, color1="&H00FF00&", color2="&HFFFFFF&", ratio=0.7):
+def color_line_dynamically(line, color1="&HFFFF00&", color2="&HFFFFFF&", ratio=0.7):
     """
     line: মূল টেক্সট (একটি সাবটাইটেল লাইন)
     color1: প্রথম অংশের রঙ (ASS BGR format, উদাহরণ: &H00FF00& = সবুজ)
@@ -591,146 +1342,6 @@ def generate_subtitles(audio_file, subtitle_file, subtitle_format='srt'):
                 f.write(f"{animated_text}\n")
     print(f"✅ Subtitles generated (chunked): {subtitle_file}")
 
-def create_karaoke_line(words, line_start, line_end):
-    """
-    words: [{'start': float, 'end': float, 'word': string}, ...]
-    line_start, line_end: পুরো লাইনের শুরু ও শেষ সময় (সেকেন্ডে)
-    রিটার্ন: \k ট্যাগসহ একটি স্ট্রিং, যাতে শব্দগুলোর উচ্চারণকাল অনুযায়ী হাইলাইট হয়।
-    """
-    karaoke_text = ""
-    for w in words:
-        w_start = w["start"] - line_start
-        w_end = w["end"] - line_start
-        duration_sec = max(0, w_end - w_start)
-        duration_cs = int(duration_sec * 100)
-        karaoke_text += f"{{\\k{duration_cs}}}{w['word']} "
-    karaoke_text += "{\\k0}"
-    return karaoke_text.strip()
-
-def split_into_chunks_karaoke(result, words_per_line=5):
-    """
-    Whisper result থেকে word-level তথ্য নিয়ে প্রতিটি চাঙ্ককে (প্রতি words_per_line টি ওয়ার্ড বা যতি চিহ্নে)
-    একটি করে "ক্যারাওকে লাইন" হিসেবে রিটার্ন করে।
-    """
-    all_chunks = []
-    current_words = []
-    chunk_start_time = None
-    chunk_end_time = None
-    for seg in result["segments"]:
-        for w in seg["words"]:
-            if chunk_start_time is None:
-                chunk_start_time = w["start"]
-            chunk_end_time = w["end"]
-            current_words.append(w)
-            if (len(current_words) >= words_per_line) or any(punct in w["word"] for punct in [".", "!", "?", ","]):
-                karaoke_line = create_karaoke_line(current_words, chunk_start_time, chunk_end_time)
-                all_chunks.append({
-                    "start": chunk_start_time,
-                    "end": chunk_end_time,
-                    "text": karaoke_line
-                })
-                current_words = []
-                chunk_start_time = None
-                chunk_end_time = None
-    if current_words:
-        karaoke_line = create_karaoke_line(current_words, chunk_start_time, chunk_end_time)
-        all_chunks.append({
-            "start": chunk_start_time,
-            "end": chunk_end_time,
-            "text": karaoke_line
-        })
-    return all_chunks
-
-def generate_subtitles_karaoke_chunked(audio_file, subtitle_file, words_per_line=5):
-    """
-    Whisper থেকে word-level timestamps নিয়ে, প্রতি words_per_line ওয়ার্ডে চাঙ্ক করে
-    ক্যারাওকে এফেক্ট সহ .ass ফাইল তৈরি করে।
-    """
-    global model
-    # অডিও ফাইল লোড করা
-    audio_tensor = whisper.load_audio(audio_file)  # Ensure this is a numpy array first
-    audio_tensor = torch.from_numpy(audio_tensor).float().to(device)  # Convert numpy array to tensor and move it to the device
-    
-    result = model.transcribe(audio_tensor, word_timestamps=True, task='transcribe')
-    if not result or "segments" not in result or not result["segments"]:
-        print(f"❌ Transcription failed or empty segments for: {audio_file}")
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            f.write("")
-        return
-    chunks = split_into_chunks_karaoke(result, words_per_line=words_per_line)
-    subs = pysubs2.SSAFile()
-    fade_tag = r"{\fad(300,300)}"
-    for chunk in chunks:
-        start_ms = chunk["start"] * 1000
-        end_ms = chunk["end"] * 1000
-        karaoke_line = chunk["text"]
-        karaoke_line = fade_tag + karaoke_line
-        karaoke_line = karaoke_line.upper()
-        event = pysubs2.SSAEvent(
-            start=start_ms,
-            end=end_ms,
-            text=karaoke_line
-        )
-        subs.append(event)
-    subs.styles["Default"].fontname = "Montserrat"
-    subs.styles["Default"].fontsize = 24
-    subs.styles["Default"].bold = True
-    subs.styles["Default"].alignment = 2
-    subs.styles["Default"].outline = 4
-    subs.styles["Default"].shadow = 3
-    subs.styles["Default"].borderstyle = 1
-    subs.styles["Default"].marginv = 60
-    subs.styles["Default"].secondarycolor = pysubs2.Color(0, 255, 0, 0)
-    subs.save(subtitle_file)
-    print(f"✅ Karaoke subtitles (chunked) generated: {subtitle_file}")
-
-def generate_subtitles_karaoke(audio_file, subtitle_file):
-    """
-    Whisper থেকে word-level timestamps নিয়ে প্রতিটি সেগমেন্টকে ক্যারাওকে এফেক্ট সহ .ass ফাইল তৈরি করে।
-    """
-    global model
-    # অডিও ফাইল লোড করা
-    audio_tensor = whisper.load_audio(audio_file)  # Ensure this is a numpy array first
-    audio_tensor = torch.from_numpy(audio_tensor).float().to(device)  # Convert numpy array to tensor and move it to the device
-    
-    result = model.transcribe(audio_tensor, word_timestamps=True, task='transcribe')
-    if not result or "segments" not in result or not result["segments"]:
-        print(f"❌ Transcription failed or empty segments for: {audio_file}")
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            f.write("")
-        return
-    subs = pysubs2.SSAFile()
-    fade_tag = r"{\fad(300,300)}"
-    for seg in result["segments"]:
-        seg_start = seg["start"]
-        seg_end = seg["end"]
-        words = seg["words"]
-        if not words:
-            continue
-        karaoke_line = create_karaoke_line(words, seg_start, seg_end)
-        karaoke_line = fade_tag + karaoke_line
-        karaoke_line = karaoke_line.upper()
-        event = pysubs2.SSAEvent(
-            start=seg_start * 1000,
-            end=seg_end * 1000,
-            text=karaoke_line
-        )
-        subs.append(event)
-    subs.styles["Default"].fontname = "Montserrat"
-    subs.styles["Default"].fontsize = 22
-    subs.styles["Default"].bold = True
-    subs.styles["Default"].alignment = 2
-    subs.styles["Default"].outline = 4
-    subs.styles["Default"].shadow = 3
-    subs.styles["Default"].borderstyle = 1
-    subs.styles["Default"].marginv = 60
-    subs.styles["Default"].secondarycolor = pysubs2.Color(0, 255, 0, 0)
-    karaoke_style = subs.styles["Default"].copy()
-    karaoke_style.primarycolor = pysubs2.Color(255, 255, 255, 0)
-    karaoke_style.secondarycolor = pysubs2.Color(255, 255, 0, 0)
-    subs.styles["Karaoke"] = karaoke_style
-    subs.save(subtitle_file)
-    print(f"✅ Karaoke subtitles generated: {subtitle_file}")
 
 def clear_audio_and_temp_folders(audio_file, temp_folder):
     """Delete specific audio file and its related temp files."""
@@ -806,86 +1417,27 @@ def create_video(stock_video, audio_file, output_video, is_short=False, use_kara
                 
                 if ai_voice_file and os.path.exists(ai_voice_file):
                     print(f"✅ Using AI voice: {ai_voice_file}")
-                    
-                    # AI ভয়েসের সাথে ব্যাকগ্রাউন্ড মিউজিক মিক্স করুন
-                    bgm_file = get_random_file(BACKGROUND_MUSIC_FOLDER, (".mp3", ".wav"))
-                    if bgm_file:
-                        mixed_audio = os.path.join(video_specific_temp, "mixed_audio.m4a")
-                        
-                        # উন্নত মিক্সিং ফিল্টার:
-                        # 1. ব্যাকগ্রাউন্ড মিউজিকের ভলিউম আরো কমিয়ে দেওয়া (0.1 থেকে 0.05)
-                        # 2. স্পিচ ভলিউম বাড়ানো (1.5x)
-                        # 3. মিক্সিং এর সময় ওয়েটেজ পরিবর্তন (স্পিচকে অগ্রাধিকার দেওয়া)
-                        mix_cmd = (
-                            f'ffmpeg -i "{ai_voice_file}" -i "{bgm_file}" -filter_complex '
-                            f'"[0:a]volume=1.5[speech];'
-                            f'[1:a]aloop=loop=-1:size=2*44100*60,volume=0.05[music];'
-                            f'[speech][music]amix=inputs=2:duration=first:weights=10 1:dropout_transition=3" '
-                            f'-c:a aac -b:a 192k "{mixed_audio}" -y'
-                        )
-                        
-                        subprocess.run(mix_cmd, shell=True)
-                        
-                        # যাচাই করুন যে মিক্স সফল হয়েছে
-                        if os.path.exists(mixed_audio) and os.path.getsize(mixed_audio) > 0:
-                            print(f"✅ Mixed audio with enhanced speech volume and reduced background music")
-                            final_audio = mixed_audio
-                        else:
-                            print(f"⚠️ Failed to mix audio, using original AI voice")
-                            final_audio = ai_voice_file
-                    else:
-                        final_audio = ai_voice_file
-                        print("⚠️ No background music found, using AI voice without music")
+                    main_audio = ai_voice_file
                 else:
                     print("❌ AI voice generation failed, using original audio")
-                    final_audio = audio_file
+                    main_audio = audio_file
             else:
                 print("❌ Transcription failed, using original audio")
-                final_audio = audio_file
+                main_audio = audio_file
         else:
-            # ব্যাকগ্রাউন্ড মিউজিক মিক্স করুন (যদি AI ভয়েস না হয়)
-            # ব্যাকগ্রাউন্ড মিউজিক মিক্সিং অংশ আপডেট করুন (যদি AI ভয়েস না হয়)
-            bgm_file = get_random_file(BACKGROUND_MUSIC_FOLDER, (".mp3", ".wav"))
-            if bgm_file:
-                mixed_audio = os.path.join(video_specific_temp, "mixed_audio.m4a")
-                
-                # উন্নত মিক্সিং ফিল্টার:
-                # 1. ব্যাকগ্রাউন্ড মিউজিকের ভলিউম আরো কমিয়ে দেওয়া (0.1 থেকে 0.05)
-                # 2. স্পিচ ভলিউম বাড়ানো (1.5x)
-                # 3. মিক্সিং এর সময় ওয়েটেজ পরিবর্তন (স্পিচকে অগ্রাধিকার দেওয়া)
-                mix_cmd = (
-                    f'ffmpeg -i "{audio_file}" -i "{bgm_file}" -filter_complex '
-                    f'"[0:a]volume=1.5[speech];'
-                    f'[1:a]aloop=loop=-1:size=2*44100*60,volume=0.05[music];'
-                    f'[speech][music]amix=inputs=2:duration=first:weights=10 1:dropout_transition=3" '
-                    f'-c:a aac -b:a 192k "{mixed_audio}" -y'
-                )
-                
-                subprocess.run(mix_cmd, shell=True)
-                
-                # যাচাই করুন যে মিক্স সফল হয়েছে
-                if os.path.exists(mixed_audio) and os.path.getsize(mixed_audio) > 0:
-                    print(f"✅ Mixed audio with enhanced speech volume and reduced background music")
-                    final_audio = mixed_audio
-                else:
-                    print(f"⚠️ Failed to mix audio, using original enhanced audio")
-                    final_audio = audio_file
-            else:
-                final_audio = audio_file
-
+            main_audio = audio_file
+        
         # অডিও ডিউরেশন চেক করুন
         audio_duration = float(
             subprocess.check_output(
-                f'ffprobe -i "{final_audio}" -show_entries format=duration -v quiet -of csv="p=0"',
+                f'ffprobe -i "{main_audio}" -show_entries format=duration -v quiet -of csv="p=0"',
                 shell=True
             ).decode().strip()
         )
         short_duration = min(audio_duration, 60) if is_short else audio_duration
-        print(f"📊 Final audio duration: {short_duration:.2f}s")
+        print(f"📊 Main audio duration: {short_duration:.2f}s")
         
         # ফেস ফুটেজ প্রসেসিং
-        # এই অংশটি create_video ফাংশনের ভিতরে রাখুন, যেখানে ফেস ফুটেজ প্রসেস করা হয়
-
         if use_face_footage:
             print("🎭 Processing face footage with guaranteed timing method...")
             # ফেস ফুটেজ নিন (সর্বোচ্চ 5 সেকেন্ডের)
@@ -1029,6 +1581,65 @@ def create_video(stock_video, audio_file, output_video, is_short=False, use_kara
             subprocess.run(stock_cmd, shell=True)
             used_video = stock_only_video
         
+        # ব্যাকগ্রাউন্ড মিউজিক প্রসেসিং - নতুন পদ্ধতি
+        bgm_file = get_random_file(BACKGROUND_MUSIC_FOLDER, (".mp3", ".wav", ".m4a", ".ogg"))
+        if bgm_file:
+            print(f"🎵 Selected background music: {os.path.basename(bgm_file)}")
+            
+            # ব্যাকগ্রাউন্ড মিউজিক অডিও ডিউরেশন চেক করুন
+            try:
+                bgm_duration = float(
+                    subprocess.check_output(
+                        f'ffprobe -i "{bgm_file}" -show_entries format=duration -v quiet -of csv="p=0"',
+                        shell=True
+                    ).decode().strip()
+                )
+                print(f"🎵 Audio duration: {short_duration}s, BGM duration: {bgm_duration}s")
+            except:
+                bgm_duration = 0
+                print("⚠️ Could not determine BGM duration")
+            
+            # ব্যাকগ্রাউন্ড মিউজিক লুপিং - অডিও দৈর্ঘ্য ঠিকমত সেট করা
+            looped_bgm = os.path.join(video_specific_temp, "looped_bgm.mp3")
+            loop_cmd = f'ffmpeg -stream_loop -1 -i "{bgm_file}" -t {short_duration} -c:a copy "{looped_bgm}" -y'
+            subprocess.run(loop_cmd, shell=True)
+            
+            # এবার উচ্চ ভলিউমে ব্যাকগ্রাউন্ড মিউজিক যোগ করুন
+            mixed_audio = os.path.join(video_specific_temp, "bgm_mixed_audio.m4a")
+            print(f"🎚️ Mixing audio with higher BGM volume (0.5 or 50%)")
+            
+            mix_cmd = (
+                f'ffmpeg -i "{main_audio}" -i "{looped_bgm}" -filter_complex '
+                f'"[0:a]volume=1.5[speech];'
+                f'[1:a]volume=0.3[music];'  # ব্যাকগ্রাউন্ড ভলিউম আরও কমাতে
+                f'[speech][music]amix=inputs=2:duration=first:weights=7 1:dropout_transition=5" '  # ভয়েসের ওজন বাড়াতে
+                f'-c:a aac -b:a 320k "{mixed_audio}" -y'  # বিটরেট বাড়ালাম
+            )
+            
+            subprocess.run(mix_cmd, shell=True)
+            
+            # মিক্সিং যাচাই করুন
+            if os.path.exists(mixed_audio) and os.path.getsize(mixed_audio) > 1000:
+                final_audio = mixed_audio
+                
+                # মিক্সড অডিও যাচাই করুন
+                try:
+                    mixed_duration = float(
+                        subprocess.check_output(
+                            f'ffprobe -i "{mixed_audio}" -show_entries format=duration -v quiet -of csv="p=0"',
+                            shell=True
+                        ).decode().strip()
+                    )
+                    print(f"✅ Successfully mixed audio with BGM: {mixed_duration}s")
+                except:
+                    print("⚠️ Could not verify mixed audio duration")
+            else:
+                print("⚠️ Failed to mix with BGM, using original audio")
+                final_audio = main_audio
+        else:
+            print("⚠️ No background music found, using original audio")
+            final_audio = main_audio
+        
         # সাবটাইটেল তৈরি করুন - প্রতিটি ভিডিওর জন্য আলাদা ইউনিক ফাইলনাম ব্যবহার করুন
         unique_subtitle_id = f"{sanitized_folder_name}_{int(time.time())}"
         temp_subtitle_ass = os.path.join(video_specific_temp, f"subtitles_{unique_subtitle_id}.ass")
@@ -1036,30 +1647,37 @@ def create_video(stock_video, audio_file, output_video, is_short=False, use_kara
         if use_ai_voice:
             # AI ভয়েসের জন্য সাবটাইটেল তৈরি করুন
             if use_karaoke:
-                generate_subtitles_karaoke_chunked(final_audio, temp_subtitle_ass, words_per_line=5)
+                generate_subtitles_karaoke_chunked(final_audio, temp_subtitle_ass, model, words_per_line=5)
             else:
                 # ইউনিক নাম ব্যবহার করুন
                 temp_subtitle_srt = os.path.join(video_specific_temp, f"subtitles_{unique_subtitle_id}.srt")
                 generate_subtitles(final_audio, temp_subtitle_srt, subtitle_format='srt')
-                convert_srt_to_ass(temp_subtitle_srt, temp_subtitle_ass, is_short=is_short)
+                convert_srt_to_ass(temp_subtitle_srt, temp_subtitle_ass, is_short=is_short, position=random.choice(['top', 'bottom', 'left', 'right', 'center']))
         else:
             # নরমাল অডিওর জন্য সাবটাইটেল তৈরি করুন
             if use_karaoke:
-                generate_subtitles_karaoke_chunked(final_audio, temp_subtitle_ass, words_per_line=5)
+                generate_subtitles_karaoke_chunked(final_audio, temp_subtitle_ass, model, words_per_line=5)
             else:
                 # ইউনিক নাম ব্যবহার করুন
                 temp_subtitle_srt = os.path.join(video_specific_temp, f"subtitles_{unique_subtitle_id}.srt")
                 generate_subtitles(final_audio, temp_subtitle_srt, subtitle_format='srt')
-                convert_srt_to_ass(temp_subtitle_srt, temp_subtitle_ass, is_short=is_short)
+                convert_srt_to_ass(temp_subtitle_srt, temp_subtitle_ass, is_short=is_short, position=random.choice(['top', 'bottom', 'left', 'right', 'center']))
 
         # ভিডিও, অডিও এবং সাবটাইটেল একত্রিত করুন
         subtitle_path = os.path.abspath(temp_subtitle_ass).replace("\\", "/").replace(":", "\\:")
+        
+        print(f"🔊 Final audio path: {final_audio}")
+        print(f"🎥 Using video: {used_video}")
+        print(f"📄 Using subtitle: {subtitle_path}")
+        
         merge_cmd = (
             f'ffmpeg -i "{used_video}" -i "{final_audio}" '
             f'-map 0:v -map 1:a '
             f'-vf "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.5:t=fill,ass=\'{subtitle_path}\'" '
-            f'-c:v libx264 -c:a aac -preset fast -crf 18 -r 30 "{output_video}" -y'
+            f'-c:v libx264 -c:a aac -b:a 256k -preset fast -crf 18 -r 30 "{output_video}" -y'
         )
+        
+        print(f"📝 Running final merge command...")
         subprocess.run(merge_cmd, shell=True)
 
         # ফাইনাল ভিডিও ফাইল নাম তৈরি করুন
@@ -1067,6 +1685,19 @@ def create_video(stock_video, audio_file, output_video, is_short=False, use_kara
         
         # আউটপুট ভিডিও থেকে ফাইনাল ভিডিও পাথে মুভ করুন
         os.rename(output_video, final_video_path)
+        
+        # যাচাই করুন ফাইনাল ভিডিওতে অডিও আছে কিনা
+        try:
+            audio_check_cmd = f'ffprobe -i "{final_video_path}" -show_streams -select_streams a -loglevel error'
+            audio_result = subprocess.run(audio_check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            if audio_result.stdout.strip():
+                print(f"✅ Final video has audio track: {final_video_path}")
+            else:
+                print(f"⚠️ WARNING: Final video may not have audio track: {final_video_path}")
+        except Exception as e:
+            print(f"⚠️ Could not check final video audio: {e}")
+            
         print(f"✅ Final Video Created: {final_video_path}")
         
         # টেক্সট আউটপুট ফাইল তৈরি করুন
@@ -1108,52 +1739,60 @@ def create_video(stock_video, audio_file, output_video, is_short=False, use_kara
 
 def process_audio_in_parallel(audio_file, is_short=False, prefix='', suffix='', use_ai_voice=False, use_face_footage=False):
     """একটি অডিও ফাইল প্রসেস করে (নরমাল বা শর্টস) প্যারালেল থ্রেডে চালায়।"""
-    audio_name = os.path.splitext(os.path.basename(audio_file))[0]
-    
-    audio_temp_folder = os.path.join(TEMP_FOLDER, audio_name)
-    os.makedirs(audio_temp_folder, exist_ok=True)
-    filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
-    
-    output_video = get_output_filename(audio_file, is_short, prefix, suffix)
-    
-    # অডিও প্রসেসিং
-    remove_background_music(audio_file, filtered_audio, audio_temp_folder)
-    
-    # AI ভয়েস জেনারেট করা (যদি use_ai_voice=True হয়)
-    final_audio = filtered_audio
-    transcript = ""
-    
-    if use_ai_voice:
-        print("🎙️ Transcribing audio for AI voice generation...")
-        transcript = transcribe_audio(filtered_audio)
+    try:
+        audio_name = os.path.splitext(os.path.basename(audio_file))[0]
+        audio_temp_folder = os.path.join(TEMP_FOLDER, audio_name)
+        os.makedirs(audio_temp_folder, exist_ok=True)
+        output_video = get_output_filename(audio_file, is_short, prefix, suffix)
         
-        if transcript:
-            # AI ভয়েস জেনারেট করুন
-            ai_voice_file = transcribe_and_generate_ai_voice(transcript, audio_name, audio_temp_folder)
+        # AI ভয়েসের জন্য উন্নত চাংক-ভিত্তিক ট্রান্সক্রিপশন ব্যবহার করুন
+        if use_ai_voice:
+            print("🎙️ Using enhanced chunked transcription for AI voice generation...")
+            
+            # শর্টস ভিডিও এবং লং ভিডিও উভয়ের জন্য একই উন্নত পদ্ধতি
+            ai_voice_file = process_long_audio_with_chunked_transcription(audio_file, audio_temp_folder)
             
             if ai_voice_file and os.path.exists(ai_voice_file):
-                print(f"✅ Using AI voice: {ai_voice_file}")
+                print(f"✅ AI voice generation successful using chunked transcription")
                 final_audio = ai_voice_file
+            else:
+                print("❌ AI voice generation failed, using original audio")
+                # ব্যাকগ্রাউন্ড মিউজিক রিমুভ করুন
+                filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
+                remove_background_music(audio_file, filtered_audio, audio_temp_folder)
+                final_audio = filtered_audio
                 
-                # AI ভয়েসের অডিও ডিউরেশন চেক করুন
-                try:
-                    ai_voice_duration = float(
-                        subprocess.check_output(
-                            f'ffprobe -i "{ai_voice_file}" -show_entries format=duration -v quiet -of csv="p=0"',
-                            shell=True
-                        ).decode().strip()
-                    )
-                    print(f"✅ AI Voice Duration: {ai_voice_duration:.2f} seconds")
-                except Exception as e:
-                    print(f"⚠️ Could not check AI voice duration: {e}")
-    
-    # ভিডিও তৈরি করা
-    create_video(STOCK_VIDEO, final_audio, output_video, is_short=is_short, use_karaoke=True, 
-                temp_folder=audio_temp_folder, use_ai_voice=use_ai_voice, use_face_footage=use_face_footage)
+        else:
+            # রেগুলার ভয়েসের জন্য (পুরানো পদ্ধতি)
+            # শর্টস ভিডিওগুলোর জন্য সরাসরি প্রসেস করুন
+            if is_short:
+                filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
+                remove_background_music(audio_file, filtered_audio, audio_temp_folder)
+                final_audio = filtered_audio
+            else:
+                # লম্বা ভিডিওগুলোর জন্য চাঙ্ক প্রসেস ব্যবহার করুন
+                print("🔄 Checking if audio needs chunk processing...")
+                final_audio = process_long_audio_in_chunks(audio_file, audio_temp_folder, use_ai_voice=False)
+                
+                if not final_audio:
+                    print("❌ Failed to process audio in chunks, trying direct processing")
+                    filtered_audio = os.path.join(audio_temp_folder, f"{audio_name}_filtered.wav")
+                    remove_background_music(audio_file, filtered_audio, audio_temp_folder)
+                    final_audio = filtered_audio
+        
+        # অডিও দিয়ে ভিডিও তৈরি করুন
+        success = create_video(STOCK_VIDEO, final_audio, output_video, is_short=is_short, use_karaoke=True, 
+                  temp_folder=audio_temp_folder, use_ai_voice=use_ai_voice, use_face_footage=use_face_footage)
 
-    # Clear the specific audio and temp folder after processing
-    clear_audio_and_temp_folders(audio_file, TEMP_FOLDER)
-  
+        # প্রসেসিং শেষে অডিও এবং টেম্প ফোল্ডার পরিষ্কার করুন
+        clear_audio_and_temp_folders(audio_file, TEMP_FOLDER)
+        
+        return success
+    
+    except Exception as e:
+        print(f"❌ Error in process_audio_in_parallel: {e}")
+        return False
+       
 def get_audio_from_old_audio():
     """old_audio ফোল্ডার থেকে mp3, wav, বা m4a ফাইল লোড করে এবং সেনিটাইজ করে"""
     if not os.path.isdir(OLD_AUDIO_FOLDER):
@@ -1195,123 +1834,158 @@ def get_audio_from_old_audio():
                 
     return sanitized_files
 
-def batch_process():
-    """Process batch of normal and shorts videos one by one with support for AI voice and face footage."""
-    clear_temp_folder()
-    old_audio_files = get_audio_from_old_audio()  # old_audio ফোল্ডার থেকে ফাইলগুলো নিয়ে আসুন
-
-    # URL লিস্ট ফাইল বোঝার জন্য চেক করুন
-    has_ai_voice_shorts = os.path.isfile(YOUTUBE_AI_VOICE_SHORTS_URL_FILE) and os.path.getsize(YOUTUBE_AI_VOICE_SHORTS_URL_FILE) > 0
-    has_ai_voice_long = os.path.isfile(YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE) and os.path.getsize(YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE) > 0
-    has_regular_shorts = os.path.isfile(YOUTUBE_SHORTS_URL_FILE) and os.path.getsize(YOUTUBE_SHORTS_URL_FILE) > 0
-    has_regular_videos = os.path.isfile(YOUTUBE_URL_FILE) and os.path.getsize(YOUTUBE_URL_FILE) > 0
+# def process_clone_voice_audio(audio_file, temp_folder):
+#     """
+#     Audio file থেকে ট্রান্সক্রিপ্ট করে এবং ক্লোন ভয়েস জেনারেট করে।
+#     """
+#     audio_name = os.path.splitext(os.path.basename(audio_file))[0]
     
-    # ফেস ফুটেজ URL ফাইল চেক
-    has_face_shorts = os.path.isfile(YOUTUBE_SHORTS_WITH_FACE_URL_FILE) and os.path.getsize(YOUTUBE_SHORTS_WITH_FACE_URL_FILE) > 0
-    has_face_long = os.path.isfile(YOUTUBE_LONG_WITH_FACE_URL_FILE) and os.path.getsize(YOUTUBE_LONG_WITH_FACE_URL_FILE) > 0
-    has_face_ai_shorts = os.path.isfile(YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE) and os.path.getsize(YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE) > 0
-    has_face_ai_long = os.path.isfile(YOUTUBE_LONG_WITH_FACE_AI_URL_FILE) and os.path.getsize(YOUTUBE_LONG_WITH_FACE_AI_URL_FILE) > 0
+#     # ট্রান্সক্রিপ্ট করুন
+#     transcript = transcribe_audio(audio_file)
+    
+#     if not transcript:
+#         print(f"❌ Failed to transcribe {audio_file}")
+#         return None
+    
+#     print(f"✅ Transcription completed for {audio_name}")
+    
+#     # ক্লোন ভয়েস জেনারেট করুন
+#     cloned_audio = generate_cloned_voice_from_transcript(
+#         transcript=transcript,
+#         clone_audio_folder=CLONE_AUDIO_FOLDER,
+#         output_folder=temp_folder,
+#         language="en"  # বাংলা ভাষার জন্য
+#     )
+    
+#     if not cloned_audio:
+#         print(f"❌ Failed to generate cloned voice for {audio_name}")
+#         return None
+    
+#     print(f"✅ Generated cloned voice for {audio_name}")
+#     return cloned_audio
 
-    # যদি old_audio ফোল্ডারে কোনো ফাইল না থাকে, তবে YouTube থেকে অডিও ডাউনলোড করুন
-    if not old_audio_files:
-        # ০. ফেস ফুটেজ ফাইল সংখ্যা চেক করুন
+
+def batch_process():
+    """
+    সকল URL ফাইল এবং old_audio ফোল্ডারের ফাইলগুলো প্রসেস করে।
+    আপডেটেড: আরও নির্ভরযোগ্য এরর হ্যান্ডলিং এবং মাস্টার URL প্রসেসর ব্যবহার করা হয়েছে।
+    """
+    # প্রয়োজনীয় ফোল্ডার চেক করুন
+    print("\n🔹 গুরুত্বপূর্ণ ফোল্ডারগুলো চেক করা হচ্ছে:")
+    critical_folders = [
+        {"path": BACKGROUND_MUSIC_FOLDER, "name": "ব্যাকগ্রাউন্ড মিউজিক ফোল্ডার", "extensions": ["*.mp3", "*.wav"]},
+        {"path": STOCK_VIDEOS_FOLDER, "name": "স্টক ভিডিও ফোল্ডার", "extensions": ["*.mp4", "*.mov"]},
+        {"path": SHORTS_STOCK_VIDEOS_FOLDER, "name": "শর্টস স্টক ভিডিও ফোল্ডার", "extensions": ["*.mp4", "*.mov"]},
+        {"path": REAL_FOOTAGE_SHORTS_FOLDER, "name": "রিয়েল ফুটেজ শর্টস ফোল্ডার", "extensions": ["*.mp4", "*.mov"]},
+        {"path": REAL_FOOTAGE_LONG_FOLDER, "name": "রিয়েল ফুটেজ লং ফোল্ডার", "extensions": ["*.mp4", "*.mov"]}
+    ]
+    
+    for folder_info in critical_folders:
+        path = folder_info["path"]
+        name = folder_info["name"]
+        extensions = folder_info["extensions"]
+        
+        print(f"\n🔍 চেক করা হচ্ছে: {name} ({path})")
+        
+        if not os.path.exists(path):
+            print(f"❌ ফোল্ডার খুঁজে পাওয়া যায়নি: {path}")
+            print(f"✅ ফোল্ডার তৈরি করা হচ্ছে...")
+            os.makedirs(path, exist_ok=True)
+        
+        # ফাইল সংখ্যা গণনা
+        all_files = []
+        for ext in extensions:
+            all_files.extend(glob(os.path.join(path, ext)))
+        
+        if all_files:
+            print(f"✅ {len(all_files)}টি ফাইল পাওয়া গেছে: {[os.path.basename(f) for f in all_files[:5]]} {'...' if len(all_files) > 5 else ''}")
+        else:
+            print(f"⚠️ কোনো ফাইল পাওয়া যায়নি। ফোল্ডারে ফাইল যোগ করুন: {path}")
+    
+    # অস্থায়ী ফোল্ডার পরিষ্কার করুন
+    clear_temp_folder()
+    
+    # old_audio ফোল্ডার থেকে ফাইলগুলো নিয়ে আসুন
+    old_audio_files = get_audio_from_old_audio()
+    
+    # যদি old_audio ফোল্ডারে কোনো ফাইল থাকে
+    if old_audio_files:
+        print(f"\n🔹 old_audio ফোল্ডার থেকে {len(old_audio_files)}টি ফাইল পাওয়া গেছে। এগুলো প্রসেস করা হচ্ছে:")
+        
+        success_count = 0
+        fail_count = 0
+        
+        for idx, audio_file in enumerate(old_audio_files, 1):
+            video_title = os.path.splitext(os.path.basename(audio_file))[0]
+            print(f"\n🎵 প্রসেসিং ({idx}/{len(old_audio_files)}): {video_title}")
+            
+            try:
+                result = process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=False, use_face_footage=False)
+                if result:
+                    success_count += 1
+                    print(f"✅ সফলভাবে ভিডিও তৈরি হয়েছে: {video_title}")
+                else:
+                    fail_count += 1
+                    print(f"❌ ভিডিও তৈরি করতে ব্যর্থ: {video_title}")
+            except Exception as e:
+                fail_count += 1
+                print(f"❌ অডিও প্রসেস করতে এরর: {e}")
+        
+        print(f"\n🔹 old_audio ফোল্ডার প্রসেসিং সম্পন্ন: {success_count}টি সফল, {fail_count}টি ব্যর্থ")
+    
+    # YouTube URL ফাইলগুলো প্রসেস করুন
+    else:
+        print("\n🔹 old_audio ফোল্ডারে কোনো ফাইল নেই। YouTube URL ফাইলগুলো প্রসেস করা হচ্ছে...")
+        
+        # ফেস ফুটেজ ফাইল সংখ্যা চেক করুন (যদি ফেস ফুটেজ ব্যবহার করতে হয়)
         face_file_counts = face_handler.check_face_footage_files()
         
-        # ১. ফেস ফুটেজ সহ শর্টস (রেগুলার অডিও)
-        if has_face_shorts:
-            print("\n🔹 Processing Face Footage Shorts from YouTube:")
-            face_shorts = download_youtube_audio(YOUTUBE_SHORTS_WITH_FACE_URL_FILE)
-            for audio_file in face_shorts:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing face footage shorts: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=True, use_ai_voice=False, use_face_footage=True)
-        
-        # ২. ফেস ফুটেজ সহ লং ভিডিও (রেগুলার অডিও)
-        if has_face_long:
-            print("\n🔹 Processing Face Footage Long Videos from YouTube:")
-            face_long = download_youtube_audio(YOUTUBE_LONG_WITH_FACE_URL_FILE)
-            for audio_file in face_long:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing face footage long video: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=False, use_face_footage=True)
-        
-        # ৩. ফেস ফুটেজ সহ শর্টস (AI ভয়েস)
-        if has_face_ai_shorts:
-            print("\n🔹 Processing Face Footage Shorts with AI Voice from YouTube:")
-            face_ai_shorts = download_youtube_audio(YOUTUBE_SHORTS_WITH_FACE_AI_URL_FILE)
-            for audio_file in face_ai_shorts:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing face footage shorts with AI voice: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=True, use_ai_voice=True, use_face_footage=True)
-        
-        # ৪. ফেস ফুটেজ সহ লং ভিডিও (AI ভয়েস)
-        if has_face_ai_long:
-            print("\n🔹 Processing Face Footage Long Videos with AI Voice from YouTube:")
-            face_ai_long = download_youtube_audio(YOUTUBE_LONG_WITH_FACE_AI_URL_FILE)
-            for audio_file in face_ai_long:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing face footage long video with AI voice: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=True, use_face_footage=True)
-        
-        # ৫. AI ভয়েস লং ভিডিও (ফেস ফুটেজ ছাড়া)
-        if has_ai_voice_long:
-            print("\n🔹 Processing AI Voice Long Videos from YouTube:")
-            ai_voice_long_videos = download_youtube_audio(YOUTUBE_AI_VOICE_LONG_VIDEO_URL_FILE)
-            for audio_file in ai_voice_long_videos:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing AI voice long video: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=True, use_face_footage=False)
-        
-        # ৬. AI ভয়েস শর্টস ভিডিও (ফেস ফুটেজ ছাড়া)
-        if has_ai_voice_shorts:
-            print("\n🔹 Processing AI Voice Shorts from YouTube:")
-            ai_voice_shorts = download_youtube_audio(YOUTUBE_AI_VOICE_SHORTS_URL_FILE)
-            for audio_file in ai_voice_shorts:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing AI voice shorts: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=True, use_ai_voice=True, use_face_footage=False)
-        
-        # ৭. রেগুলার লং ভিডিও (ফেস ফুটেজ ছাড়া)
-        if has_regular_videos:
-            print("\n🔹 Processing Regular Videos from YouTube:")
-            normal_audio_files = download_youtube_audio(YOUTUBE_URL_FILE)
-            for audio_file in normal_audio_files:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing regular video: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=False, use_face_footage=False)
-        
-        # ৮. রেগুলার শর্টস ভিডিও (ফেস ফুটেজ ছাড়া)
-        if has_regular_shorts:
-            print("\n🔹 Processing Regular Shorts from YouTube:")
-            shorts_audio_files = download_youtube_audio(YOUTUBE_SHORTS_URL_FILE)
-            for audio_file in shorts_audio_files:
-                video_title = os.path.splitext(os.path.basename(audio_file))[0]
-                print(f"\nProcessing regular shorts: {video_title}")
-                process_audio_in_parallel(audio_file, is_short=True, use_ai_voice=False, use_face_footage=False)
-    else:
-        # যদি old_audio ফোল্ডারে ফাইল থাকে, তবে সেগুলি প্রসেস করুন (এখানে আমরা AI ভয়েস ব্যবহার করছি না)
-        normal_audio_files = old_audio_files
-        for audio_file in normal_audio_files:
-            video_title = os.path.splitext(os.path.basename(audio_file))[0]
-            print(f"\nProcessing from old_audio: {video_title}")
-            process_audio_in_parallel(audio_file, is_short=False, use_ai_voice=False, use_face_footage=False)
-        
-    print("\n🎉 All videos are successfully created!")
-
+        # মাস্টার URL প্রসেসর ব্যবহার করে সব URL একসাথে প্রসেস করুন
+        process_all_url_files()
+    
+    print("\n🎉 সমস্ত ভিডিও প্রসেসিং সম্পন্ন হয়েছে!")
+    
 if __name__ == "__main__":
-    print("⏳ Loading Whisper model...")
-    
-    # ডিভাইস চেকিং এবং মডেলকে ডিভাইসে পাঠানো
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    
-    # Whisper মডেল লোড করা
-    model = whisper.load_model("small")
-    
-    # মডেলকে GPU বা CPU তে পাঠানো
-    model.to(device)
+    print("\n" + "="*80)
+    print(f"🚀 YouTube ভিডিও প্রসেসিং সিস্টেম শুরু হচ্ছে...")
+    print(f"📂 বেস পাথ: {BASE_PATH}")
+    print("="*80 + "\n")
 
-    print("✅ Whisper model loaded successfully!")
-    batch_process()
+    print("⏳ Whisper মডেল লোড করা হচ্ছে...")
+    
+    try:
+        # ডিভাইস চেকিং এবং মডেলকে ডিভাইসে পাঠানো
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print(f"✅ CUDA ডিভাইস পাওয়া গেছে: {torch.cuda.get_device_name(0)}")
+        else:
+            device = torch.device("cpu")
+            print(f"⚠️ CUDA ডিভাইস পাওয়া যায়নি, CPU ব্যবহার করা হচ্ছে")
+        
+        # Whisper মডেল লোড করা
+        model = whisper.load_model("small")
+        
+        # মডেলকে GPU বা CPU তে পাঠানো
+        model.to(device)
+        print("✅ Whisper মডেল সফলভাবে লোড হয়েছে!")
+        
+        # মেইন ব্যাচ প্রসেসিং ফাংশন কল করুন
+        batch_process()
+        
+    except Exception as e:
+        print(f"❌ প্রোগ্রাম চালাতে এরর: {e}")
+        print("দয়া করে চেক করুন:")
+        print("1. সব প্রয়োজনীয় ফোল্ডার আছে কিনা")
+        print("2. URL ফাইলগুলোতে সঠিক লিংক আছে কিনা")
+        print("3. ffmpeg ঠিকমতো ইনস্টল করা আছে কিনা")
+        print("4. সব মডিউল ইনস্টল করা আছে কিনা (pip install -r requirements.txt)")
+    
+    finally:
+        print("\n🧹 কিছু অস্থায়ী ফাইল থাকলে পরিষ্কার করা হচ্ছে...")
+        try:
+            clear_temp_folder()
+            print("✅ অস্থায়ী ফোল্ডার পরিষ্কার করা হয়েছে")
+        except:
+            pass
+        
+        print("\n👋 প্রোগ্রাম শেষ হয়েছে।")
